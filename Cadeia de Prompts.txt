@@ -1,0 +1,15 @@
+Prompt 1: "I need a powerful evolutionary algorithm for high-dimensional, multi-modal problems. What's a robust baseline we can build on?"
+
+Prompt 2: "Let's proceed with the three practical options: BIPOP-CMA-ES, LM-CMA-ES, and L-SHADE. Please provide their baseline implementations with core operators in Python. Critically, you must add a niching strategy to all three of them."
+
+Prompt 3: "Improve parameter adaptation for all three algorithms to incorporate feedback from successful operators."
+
+Prompt 4: "Add reflective bounds to keep solutions feasible across all algorithms."
+
+Prompt 5: "Integrate them with GNBG, log evaluations, and track when error <= 10^-8."
+
+Prompt 6: "Log the probabilities of the operators and evaluations per generation for each algorithm."
+
+Prompt 7: "Add population size reduction to reduce the computational burden for all three algorithms."
+
+Prompt 8: "Prepare a final integrated version containing the code for all three algorithms."

@@ -6,10 +6,16 @@ import csv
 # 0. Utility: Reflective Bounds
 # ============================================================================
 def reflect_bounds(x, lower, upper, max_reflections=10):
-    """Reflect coordinates outside [lower, upper] back into the feasible region."""
+    """Reflect coordinates outside [lower, upper] back into the feasible region.
+    
+    Handles scalar bounds (same for all dimensions) or per-dimension bounds
+    by broadcasting them to the shape of `x`.
+    """
     x = np.array(x, copy=True)
-    lower = np.array(lower)
-    upper = np.array(upper)
+    # Broadcast bounds to match the shape of x
+    lower = np.broadcast_to(lower, x.shape)
+    upper = np.broadcast_to(upper, x.shape)
+
     for _ in range(max_reflections):
         mask_low = x < lower
         mask_high = x > upper
@@ -17,6 +23,8 @@ def reflect_bounds(x, lower, upper, max_reflections=10):
             break
         x[mask_low] = 2 * lower[mask_low] - x[mask_low]
         x[mask_high] = 2 * upper[mask_high] - x[mask_high]
+
+    # Final safety clip (should rarely be needed)
     return np.clip(x, lower, upper)
 
 
@@ -31,7 +39,7 @@ class ActiveCMAES:
         self.max_evals = max_evals
         self.rng = np.random.RandomState(seed)
         if x0 is None:
-            self.xmean = self.rng.uniform(bounds[0], bounds[1]) if bounds is not None else self.rng.randn(dim)
+            self.xmean = self.rng.uniform(bounds[0], bounds[1], size=dim) if bounds is not None else self.rng.randn(dim)
         else:
             self.xmean = np.array(x0)
         self.sigma = sigma0
@@ -59,9 +67,9 @@ class ActiveCMAES:
         self.weights /= np.sum(self.weights)
         self.mueff = 1.0 / np.sum(self.weights ** 2)
 
-        # Negative weights for active update
-        self.mu_neg = max(1, self.lam // 4)
-        neg_weights = -self.weights[-self.mu_neg:] / np.sum(np.abs(self.weights[-self.mu_neg:]))
+        # Negative weights for active update (uniform, sum to -1)
+        self.mu_neg = self.lam - self.mu          # number of negative weights
+        neg_weights = -np.ones(self.mu_neg) / self.mu_neg
         self.weights_full = np.concatenate([self.weights, neg_weights])
         self.mueff_neg = 1.0 / np.sum(self.weights_full ** 2) - self.mueff
 
@@ -108,7 +116,9 @@ class ActiveCMAES:
 
         # Step-size adaptation
         self.ps = (1 - self.cs) * self.ps + np.sqrt(self.cs * (2 - self.cs) * self.mueff) * zmean
-        hsig = (np.linalg.norm(self.ps) / np.sqrt(1 - (1 - self.cs) ** (2 * self.count_evals / self.lam)) / np.sqrt(self.dim) * 1.4) < 1.0
+        # Avoid division by zero when count_evals = 0
+        denom = np.sqrt(max(1e-12, 1 - (1 - self.cs) ** (2 * self.count_evals / self.lam)))
+        hsig = (np.linalg.norm(self.ps) / denom / np.sqrt(self.dim) * 1.4) < 1.0
         self.pc = (1 - self.cc) * self.pc + hsig * np.sqrt(self.cc * (2 - self.cc) * self.mueff) * ymean_pos
 
         # Active covariance update
@@ -182,7 +192,7 @@ class BIPOP_CMAES:
             budget = min(self.max_evals - self.evals_used, int(100 * self.dim * (restart + 1)))
             if budget <= 0:
                 break
-            x0 = self.rng.uniform(self.bounds[0], self.bounds[1]) if self.bounds is not None else self.rng.randn(self.dim)
+            x0 = self.rng.uniform(self.bounds[0], self.bounds[1], size=self.dim) if self.bounds is not None else self.rng.randn(self.dim)
             cma = ActiveCMAES(self.func, self.dim, x0=x0, sigma0=sigma0, bounds=self.bounds,
                               max_evals=budget, seed=self.rng.randint(0, 1e6))
             x, f, logs = cma.run()
@@ -215,7 +225,7 @@ class ActiveLM_CMAES:
         self.max_evals = max_evals
         self.rng = np.random.RandomState(seed)
         if x0 is None:
-            self.xmean = self.rng.uniform(bounds[0], bounds[1]) if bounds is not None else self.rng.randn(dim)
+            self.xmean = self.rng.uniform(bounds[0], bounds[1], size=dim) if bounds is not None else self.rng.randn(dim)
         else:
             self.xmean = np.array(x0)
         self.sigma = sigma0
@@ -238,10 +248,13 @@ class ActiveLM_CMAES:
         self.weights = np.log(self.mu + 0.5) - np.log(np.arange(1, self.mu + 1))
         self.weights /= np.sum(self.weights)
         self.mueff = 1.0 / np.sum(self.weights ** 2)
-        self.mu_neg = max(1, self.lam // 4)
-        neg_weights = -self.weights[-self.mu_neg:] / np.sum(np.abs(self.weights[-self.mu_neg:]))
+
+        # Negative weights for active update (uniform, sum to -1)
+        self.mu_neg = self.lam - self.mu          # number of negative weights
+        neg_weights = -np.ones(self.mu_neg) / self.mu_neg
         self.weights_full = np.concatenate([self.weights, neg_weights])
         self.mueff_neg = 1.0 / np.sum(self.weights_full ** 2) - self.mueff
+
         self.cc = (4 + self.mueff / self.dim) / (self.dim + 4 + 2 * self.mueff / self.dim)
         self.cs = (self.mueff + 2) / (self.dim + self.mueff + 5)
         self.c1 = 2 / ((self.dim + 1.3) ** 2 + self.mueff)
@@ -279,7 +292,9 @@ class ActiveLM_CMAES:
         zmean = np.sum(self.weights[:, None] * arz[:self.mu], axis=0)
 
         self.ps = (1 - self.cs) * self.ps + np.sqrt(self.cs * (2 - self.cs) * self.mueff) * zmean
-        hsig = (np.linalg.norm(self.ps) / np.sqrt(1 - (1 - self.cs) ** (2 * self.count_evals / self.lam)) / np.sqrt(self.dim) * 1.4) < 1.0
+        # Avoid division by zero when count_evals = 0
+        denom = np.sqrt(max(1e-12, 1 - (1 - self.cs) ** (2 * self.count_evals / self.lam)))
+        hsig = (np.linalg.norm(self.ps) / denom / np.sqrt(self.dim) * 1.4) < 1.0
         self.pc = (1 - self.cc) * self.pc + hsig * np.sqrt(self.cc * (2 - self.cc) * self.mueff) * ymean_pos
 
         # Success-based adjustment of learning rates
@@ -386,7 +401,11 @@ class Improved_L_SHADE:
             xr2 = self.pop[self.rng.randint(self.N)]
             while np.array_equal(xr2, self.pop[idx]) or np.array_equal(xr2, xr1):
                 xr2 = self.pop[self.rng.randint(self.N)]
-        F = self.rng.normal(self.F, 0.1) if self.rng.rand() < 0.5 else self.rng.cauchy(self.F, 0.1)
+        # Use standard_cauchy instead of cauchy
+        if self.rng.rand() < 0.5:
+            F = self.rng.normal(self.F, 0.1)
+        else:
+            F = self.F + 0.1 * self.rng.standard_cauchy()
         F = np.clip(F, 0, 1)
         mutant = self.pop[idx] + F * (xpbest - self.pop[idx]) + F * (xr1 - xr2)
         mutant = reflect_bounds(mutant, self.bounds[0], self.bounds[1])
@@ -418,7 +437,11 @@ class Improved_L_SHADE:
             for i in range(self.N):
                 old_f = self.fitness[i]
                 mutant, F = self._mutate(i)
-                CR = self.rng.normal(self.M_CR[self.mem_idx], 0.1) if self.rng.rand() < 0.5 else self.rng.cauchy(self.M_CR[self.mem_idx], 0.1)
+                # Use standard_cauchy instead of cauchy
+                if self.rng.rand() < 0.5:
+                    CR = self.rng.normal(self.M_CR[self.mem_idx], 0.1)
+                else:
+                    CR = self.M_CR[self.mem_idx] + 0.1 * self.rng.standard_cauchy()
                 CR = np.clip(CR, 0, 1)
                 trial = self._crossover(self.pop[i], mutant, CR)
                 ftrial = self.func(trial)
@@ -567,17 +590,17 @@ if __name__ == "__main__":
         print(f"\n=== {algo_name} ===")
         f, bounds, optimum = get_gnbg_problem(1, dim)
 
-        # Wrap function to track eval count and error history
-        eval_count = 0
-        best_err = np.inf
+        # Use lists to allow mutation without nonlocal
+        eval_count = [0]
+        best_err = [np.inf]
         error_history = []
+
         def tracked_func(x):
-            nonlocal eval_count, best_err
-            eval_count += 1
+            eval_count[0] += 1
             fval = f(x)
-            if fval < best_err:
-                best_err = fval
-                error_history.append((eval_count, fval))
+            if fval < best_err[0]:
+                best_err[0] = fval
+                error_history.append((eval_count[0], fval))
             return fval
 
         # Run niching optimizer
@@ -601,7 +624,7 @@ if __name__ == "__main__":
 
         print(f"Best error: {best_f:.2e}")
         print(f"Evals to reach {error_threshold}: {evals_threshold if evals_threshold else 'not reached'}")
-        print(f"Total evals used: {eval_count}")
+        print(f"Total evals used: {eval_count[0]}")
         print(f"Logs captured for {len(logs)} generations")
 
         # Save logs to CSV (optional)

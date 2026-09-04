@@ -1,3 +1,15 @@
+# GNBG niching evolutionary baselines — corrected NumPy 2 / IOHGNBG integration
+# Algorithms: BIPOP-CMA-ES, LM-CMA-ES, L-SHADE
+# Includes: niching, success-conditioned operator adaptation, reflective bounds,
+# population-size reduction, FE/generation logging, GNBG integration, and
+# target tracking at error <= 1e-8.
+#
+# GNBG integration deliberately bypasses iohgnbg.get_problem()/ioh.wrap_problem.
+# IOHGNBG v0.0.2 loads the official GECCO_2025/fN.mat data and evaluates
+# GNBG.fitness through the IOH C++ wrapper. This file uses the same official
+# .mat fields and objective expression directly in NumPy, with explicit
+# scalar extraction, avoiding the NumPy/pybind11 conversion failure.
+
 from __future__ import annotations
 
 import csv
@@ -1290,110 +1302,382 @@ class BudgetedObjective:
         return value
 
 
+def _as_python_scalar(value: Any, name: str) -> float:
+    """Convert a scalar or one-element array to a Python float safely."""
+    arr = np.asarray(value)
+    if arr.size != 1:
+        raise ValueError(
+            f"{name} must contain exactly one numeric value; got shape {arr.shape}"
+        )
+    try:
+        out = float(arr.reshape(-1)[0])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be numeric; got {type(value).__name__}") from exc
+    if not np.isfinite(out):
+        raise ValueError(f"{name} must be finite; got {out}")
+    return out
+
+
 @dataclass
 class GNBGProblem:
-    """Minimal black-box adapter used by the three optimizers."""
+    """Direct, NumPy-based GNBG instance using the official ``.mat`` data.
+
+    This intentionally does not call ``iohgnbg.get_problem`` or ``ioh.wrap_problem``.
+    IOHGNBG v0.0.2 wraps ``GNBG.fitness`` through a pybind11-backed IOH callable;
+    with current NumPy/IOH combinations that path can fail before the optimizer
+    receives the objective value. The official source defines the benchmark from
+    the ``GECCO_2025/fN.mat`` parameters, so evaluating that formula directly
+    avoids the incompatible C++ conversion layer while preserving the benchmark
+    data and objective transformation.
+    """
+
     problem_id: int | str
     fun: Callable[[Array], float]
     lower: Array
     upper: Array
     optimum: float
     metadata: Any = None
+    raw_optimum_value: float = 0.0
+    max_evals: int | None = None
+    optimum_position: Array | None = None
 
     @property
     def dimension(self) -> int:
-        return int(len(self.lower))
+        return int(self.lower.size)
 
 
-def _get_nested(obj: Any, paths: list[tuple[str, ...]]) -> Any:
-    for path in paths:
-        cur = obj
-        try:
-            for name in path:
-                if isinstance(cur, dict):
-                    cur = cur[name]
+class DirectGNBG:
+    """Source-faithful GNBG evaluator without the IOH C++ wrapper.
+
+    The mathematical expression and data layout follow IOHGNBG v0.0.2
+    ``gnbg_problem.py`` / ``gnbg_base.py``. Only scalar extraction and the
+    scalar-return interface are made explicit for NumPy 2.x compatibility.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_evals: int,
+        acceptance_threshold: float,
+        dimension: int,
+        comp_num: int,
+        min_coordinate: float,
+        max_coordinate: float,
+        comp_min_pos: Array,
+        comp_sigma: Array,
+        comp_h: Array,
+        mu: Array,
+        omega: Array,
+        lam: Array,
+        rotation_matrix: Array,
+        optimum_value: float,
+        optimum_position: Array,
+    ) -> None:
+        self.MaxEvals = int(max_evals)
+        self.AcceptanceThreshold = float(acceptance_threshold)
+        self.Dimension = int(dimension)
+        self.CompNum = int(comp_num)
+        self.MinCoordinate = float(min_coordinate)
+        self.MaxCoordinate = float(max_coordinate)
+        self.CompMinPos = np.asarray(comp_min_pos, dtype=float)
+        self.CompSigma = np.asarray(comp_sigma, dtype=float)
+        self.CompH = np.asarray(comp_h, dtype=float)
+        self.Mu = np.asarray(mu, dtype=float)
+        self.Omega = np.asarray(omega, dtype=float)
+        self.Lambda = np.asarray(lam, dtype=float)
+        self.RotationMatrix = np.asarray(rotation_matrix, dtype=float)
+        self.OptimumValue = float(optimum_value)
+        self.OptimumPosition = np.asarray(optimum_position, dtype=float)
+
+        if self.CompMinPos.shape != (self.CompNum, self.Dimension):
+            raise ValueError(
+                f"Component_MinimumPosition has shape {self.CompMinPos.shape}; "
+                f"expected ({self.CompNum}, {self.Dimension})"
+            )
+        if self.CompSigma.size != self.CompNum:
+            raise ValueError(
+                f"ComponentSigma has {self.CompSigma.size} values; expected {self.CompNum}"
+            )
+        if self.CompH.shape != (self.CompNum, self.Dimension):
+            raise ValueError(
+                f"Component_H has shape {self.CompH.shape}; "
+                f"expected ({self.CompNum}, {self.Dimension})"
+            )
+        if self.Mu.shape[0] != self.CompNum or self.Mu.shape[1] != 2:
+            raise ValueError(
+                f"Mu has shape {self.Mu.shape}; expected ({self.CompNum}, 2)"
+            )
+        if self.Omega.shape[0] != self.CompNum or self.Omega.shape[1] != 4:
+            raise ValueError(
+                f"Omega has shape {self.Omega.shape}; expected ({self.CompNum}, 4)"
+            )
+        if self.Lambda.size != self.CompNum:
+            raise ValueError(
+                f"Lambda has {self.Lambda.size} values; expected {self.CompNum}"
+            )
+        if self.RotationMatrix.ndim not in (2, 3):
+            raise ValueError(
+                f"RotationMatrix must be 2-D or 3-D; got {self.RotationMatrix.shape}"
+            )
+        if self.RotationMatrix.ndim == 3:
+            expected = (self.Dimension, self.Dimension, self.CompNum)
+            if self.RotationMatrix.shape != expected:
+                raise ValueError(
+                    f"RotationMatrix has shape {self.RotationMatrix.shape}; expected {expected}"
+                )
+        else:
+            expected = (self.Dimension, self.Dimension)
+            if self.RotationMatrix.shape != expected:
+                raise ValueError(
+                    f"RotationMatrix has shape {self.RotationMatrix.shape}; expected {expected}"
+                )
+        if self.OptimumPosition.size != self.Dimension:
+            raise ValueError(
+                f"OptimumPosition has {self.OptimumPosition.size} values; expected {self.Dimension}"
+            )
+        if not np.all(np.isfinite(self.CompMinPos)):
+            raise ValueError("GNBG component minima contain non-finite values")
+        if not np.all(np.isfinite(self.CompSigma)):
+            raise ValueError("GNBG component sigma contains non-finite values")
+        if not np.all(np.isfinite(self.CompH)):
+            raise ValueError("GNBG component heights contain non-finite values")
+        if not np.all(np.isfinite(self.Mu)) or not np.all(np.isfinite(self.Omega)):
+            raise ValueError("GNBG transform parameters contain non-finite values")
+        if not np.all(np.isfinite(self.Lambda)):
+            raise ValueError("GNBG lambda contains non-finite values")
+
+    def transform(self, X: Array, alpha: Array, beta: Array) -> Array:
+        """The transformation used verbatim by IOHGNBG v0.0.2."""
+        X = np.asarray(X, dtype=float)
+        alpha = np.asarray(alpha, dtype=float).reshape(-1)
+        beta = np.asarray(beta, dtype=float).reshape(-1)
+        if alpha.size != 2 or beta.size != 4:
+            raise ValueError(
+                f"GNBG transform expects Alpha(2), Beta(4); got {alpha.shape}, {beta.shape}"
+            )
+        Y = X.copy()
+        positive = X > 0
+        Y[positive] = np.log(X[positive])
+        Y[positive] = np.exp(
+            Y[positive]
+            + alpha[0]
+            * (
+                np.sin(beta[0] * Y[positive])
+                + np.sin(beta[1] * Y[positive])
+            )
+        )
+        negative = X < 0
+        Y[negative] = np.log(-X[negative])
+        Y[negative] = -np.exp(
+            Y[negative]
+            + alpha[1]
+            * (
+                np.sin(beta[2] * Y[negative])
+                + np.sin(beta[3] * Y[negative])
+            )
+        )
+        return Y
+
+    def raw_fitness(self, X: Array) -> float | Array:
+        """Evaluate GNBG's raw fitness exactly as defined in its source."""
+        arr = np.asarray(X, dtype=float)
+        scalar_input = arr.ndim == 1
+        if arr.ndim == 0:
+            raise ValueError("GNBG input must be a 1-D search point or 2-D batch")
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+        if arr.ndim != 2:
+            raise ValueError(f"GNBG input must be 1-D or 2-D; got {arr.shape}")
+        if arr.shape[1] != self.Dimension:
+            raise ValueError(
+                f"GNBG point has dimension {arr.shape[1]}; expected {self.Dimension}"
+            )
+        if not np.all(np.isfinite(arr)):
+            raise ValueError("GNBG input contains NaN or infinite values")
+
+        result = np.empty(arr.shape[0], dtype=float)
+        for jj in range(arr.shape[0]):
+            x = arr[jj, :].reshape(-1, 1)
+            values = np.empty(self.CompNum, dtype=float)
+            for k in range(self.CompNum):
+                if self.RotationMatrix.ndim == 3:
+                    rotation_matrix = self.RotationMatrix[:, :, k]
                 else:
-                    cur = getattr(cur, name)
-            if cur is not None:
-                return cur
-        except (KeyError, AttributeError, TypeError):
-            continue
-    return None
+                    rotation_matrix = self.RotationMatrix
+
+                comp_min = self.CompMinPos[k, :].reshape(-1, 1)
+                alpha = self.Mu[k, :]
+                beta = self.Omega[k, :]
+                comp_h = self.CompH[k, :].reshape(-1)
+                sigma = _as_python_scalar(self.CompSigma[k], "CompSigma[k]")
+                exponent = _as_python_scalar(self.Lambda[k], "Lambda[k]")
+
+                # These products are the exact matrix operations used by
+                # IOHGNBG v0.0.2 GNBG.fitness().
+                a = self.transform(
+                    (x - comp_min).T @ rotation_matrix.T,
+                    alpha,
+                    beta,
+                )
+                b = self.transform(
+                    rotation_matrix @ (x - comp_min),
+                    alpha,
+                    beta,
+                )
+                quadratic = _as_python_scalar(
+                    a @ np.diag(comp_h) @ b,
+                    "GNBG quadratic form",
+                )
+                values[k] = sigma + quadratic**exponent
+
+            result[jj] = float(np.min(values))
+
+        if scalar_input:
+            return float(result[0])
+        return result
+
+    def shifted_fitness(self, X: Array) -> float | Array:
+        """Apply the official IOHGNBG objective shift ``fitness - OptimumValue``."""
+        value = self.raw_fitness(X)
+        return np.asarray(value) - self.OptimumValue if np.ndim(value) else float(value - self.OptimumValue)
 
 
-def _extract_ioh_bounds(problem: Any) -> tuple[Array, Array]:
-    candidates = [
-        (("bounds", "lb"), ("bounds", "ub")),
-        (("bounds", "lower"), ("bounds", "upper")),
-        (("lower_bound",), ("upper_bound",)),
-        (("lower_bounds",), ("upper_bounds",)),
+def _find_gnbg_instance_file(problem_id: int, instances_folder: Optional[str] = None) -> str:
+    """Locate the official GNBG ``fN.mat`` instance without importing IOH."""
+    filename = f"f{int(problem_id)}.mat"
+
+    if instances_folder is not None:
+        candidate = os.path.abspath(os.path.join(instances_folder, filename))
+        if os.path.isfile(candidate):
+            return candidate
+        raise FileNotFoundError(
+            f"GNBG instance not found: {candidate}"
+        )
+
+    # IOHGNBG v0.0.2's documented package layout is
+    # <package>/static/GECCO_2025/fN.mat. We locate the installed package
+    # using importlib metadata rather than importing iohgnbg.get_problem().
+    import importlib.util
+
+    spec = importlib.util.find_spec("iohgnbg")
+    if spec is None or not spec.submodule_search_locations:
+        raise ImportError(
+            "IOHGNBG is not installed. Install it with: python -m pip install iohgnbg"
+        )
+
+    for base in spec.submodule_search_locations:
+        candidate = os.path.join(base, "static", "GECCO_2025", filename)
+        if os.path.isfile(candidate):
+            return os.path.abspath(candidate)
+
+    searched = [
+        os.path.join(base, "static", "GECCO_2025", filename)
+        for base in spec.submodule_search_locations
     ]
-    for lp, up in candidates:
-        lo = _get_nested(problem, [lp])
-        hi = _get_nested(problem, [up])
-        if lo is not None and hi is not None:
-            lo = np.asarray(lo, dtype=float).ravel()
-            hi = np.asarray(hi, dtype=float).ravel()
-            if lo.shape == hi.shape and lo.size and np.all(np.isfinite(lo)) and np.all(np.isfinite(hi)):
-                return lo, hi
-    # Some IOH/GNBG wrappers expose bounds as a pair.
-    bounds = getattr(problem, "bounds", None)
-    if isinstance(bounds, (tuple, list)) and len(bounds) == 2:
-        lo, hi = map(lambda z: np.asarray(z, dtype=float).ravel(), bounds)
-        if lo.shape == hi.shape and lo.size:
-            return lo, hi
-    raise AttributeError("Could not extract lower/upper bounds from GNBG problem")
-
-
-def _extract_ioh_optimum(problem: Any) -> float:
-    candidates = [
-        (("optimum", "y"),),
-        (("optimum", "value"),),
-        (("objective", "y"),),
-        (("objective", "optimal_value"),),
-        (("best_known",),),
-        (("best_value",),),
-    ]
-    for path_group in candidates:
-        value = _get_nested(problem, [path_group[0]])
-        if value is not None and np.ndim(value) == 0 and np.isfinite(float(value)):
-            return float(value)
-    md = getattr(problem, "meta_data", None)
-    if isinstance(md, dict):
-        for key in ("best_known", "best_value", "optimal_value", "optimum"):
-            if key in md and np.ndim(md[key]) == 0:
-                return float(md[key])
-    raise AttributeError("Could not extract GNBG optimum value; pass it explicitly")
-
-
-def gnbg_from_ioh_problem(problem: Any, problem_id: int | str = "") -> GNBGProblem:
-    """Adapt an ``iohgnbg.get_problem(id)`` object without reading GNBG internals."""
-    lo, hi = _extract_ioh_bounds(problem)
-    optimum = _extract_ioh_optimum(problem)
-    return GNBGProblem(
-        problem_id=problem_id,
-        fun=lambda x: float(problem(np.asarray(x, dtype=float))),
-        lower=lo,
-        upper=hi,
-        optimum=optimum,
-        metadata=getattr(problem, "meta_data", None),
+    raise FileNotFoundError(
+        "Could not locate the official GNBG instance file. Searched:\n"
+        + "\n".join(searched)
+        + "\nPass --instances-folder PATH to the directory containing fN.mat."
     )
 
 
-def load_gnbg_problem(problem_id: int) -> GNBGProblem:
-    """Load an official GNBG problem through the IOHGNBG Python wrapper.
-
-    Requires: ``pip install iohgnbg``. The wrapper is intentionally optional so
-    the optimizer module remains usable without the benchmark dependency.
-    """
+def _load_official_gnbg_data(problem_id: int, instances_folder: Optional[str] = None) -> tuple[DirectGNBG, str]:
+    """Load a GNBG instance using the same MATLAB fields as IOHGNBG v0.0.2."""
     try:
-        import iohgnbg  # type: ignore
+        from scipy.io import loadmat
     except ImportError as exc:
         raise ImportError(
-            "GNBG integration requires IOHGNBG. Install with: pip install iohgnbg"
+            "GNBG direct loading requires SciPy. Install it with: python -m pip install scipy"
         ) from exc
-    problem = iohgnbg.get_problem(problem_index=int(problem_id))
-    return gnbg_from_ioh_problem(problem, int(problem_id))
+
+    path = _find_gnbg_instance_file(problem_id, instances_folder)
+    data = loadmat(path)
+    if "GNBG" not in data:
+        raise ValueError(f"{path} does not contain the expected 'GNBG' MATLAB structure")
+    gnbg = data["GNBG"]
+
+    # These extractions mirror the official get_problem() implementation.
+    def official_scalar_field(name: str) -> float:
+        field = gnbg[name]
+        values = np.array([item[0] for item in field.flatten()])
+        if values.size != 1:
+            values = np.asarray(values).reshape(-1)
+        return _as_python_scalar(values.reshape(-1)[0], f"GNBG.{name}")
+
+    max_evals = int(round(official_scalar_field("MaxEvals")))
+    acceptance_threshold = official_scalar_field("AcceptanceThreshold")
+    dimension = int(round(official_scalar_field("Dimension")))
+    comp_num = int(round(official_scalar_field("o")))
+    min_coordinate = official_scalar_field("MinCoordinate")
+    max_coordinate = official_scalar_field("MaxCoordinate")
+
+    comp_min_pos = np.asarray(gnbg["Component_MinimumPosition"][0, 0], dtype=float)
+    comp_sigma = np.asarray(gnbg["ComponentSigma"][0, 0], dtype=float)
+    comp_h = np.asarray(gnbg["Component_H"][0, 0], dtype=float)
+    mu = np.asarray(gnbg["Mu"][0, 0], dtype=float)
+    omega = np.asarray(gnbg["Omega"][0, 0], dtype=float)
+    lam = np.asarray(gnbg["lambda"][0, 0], dtype=float)
+    rotation_matrix = np.asarray(gnbg["RotationMatrix"][0, 0], dtype=float)
+    optimum_value = official_scalar_field("OptimumValue")
+    optimum_position = np.asarray(gnbg["OptimumPosition"][0, 0], dtype=float).reshape(-1)
+
+    evaluator = DirectGNBG(
+        max_evals=max_evals,
+        acceptance_threshold=acceptance_threshold,
+        dimension=dimension,
+        comp_num=comp_num,
+        min_coordinate=min_coordinate,
+        max_coordinate=max_coordinate,
+        comp_min_pos=comp_min_pos,
+        comp_sigma=comp_sigma,
+        comp_h=comp_h,
+        mu=mu,
+        omega=omega,
+        lam=lam,
+        rotation_matrix=rotation_matrix,
+        optimum_value=optimum_value,
+        optimum_position=optimum_position,
+    )
+
+    lo = np.full(dimension, min_coordinate, dtype=float)
+    hi = np.full(dimension, max_coordinate, dtype=float)
+    if np.any(hi <= lo):
+        raise ValueError("GNBG lower/upper coordinates are invalid")
+
+    # IOHGNBG's get_problem() wraps ``gnbg.fitness(x) - OptimumValue``.
+    # Therefore the transformed GNBG objective has optimum exactly 0 by
+    # construction; the raw known optimum is retained for diagnostics.
+    problem = GNBGProblem(
+        problem_id=int(problem_id),
+        fun=lambda x, _e=evaluator: _as_python_scalar(
+            _e.shifted_fitness(np.asarray(x, dtype=float)),
+            "GNBG objective value",
+        ),
+        lower=lo,
+        upper=hi,
+        optimum=0.0,
+        metadata={
+            "source": "IOHGNBG v0.0.2 GECCO_2025 .mat",
+            "instance_file": path,
+            "raw_optimum_value": optimum_value,
+            "acceptance_threshold": acceptance_threshold,
+        },
+        raw_optimum_value=optimum_value,
+        max_evals=max_evals,
+        optimum_position=optimum_position.copy(),
+    )
+    return problem, path
+
+
+def load_gnbg_problem(problem_id: int, instances_folder: Optional[str] = None) -> GNBGProblem:
+    """Load an official GNBG problem without using the failing IOH wrapper.
+
+    ``instances_folder`` should contain the official files ``f1.mat``, ...,
+    ``f24.mat``. When omitted, the function locates the GECCO_2025 static data
+    shipped by the installed IOHGNBG package.
+    """
+    problem, _ = _load_official_gnbg_data(problem_id, instances_folder)
+    return problem
 
 
 def solve_gnbg_problem(
@@ -1404,6 +1688,7 @@ def solve_gnbg_problem(
     run: int = 0,
     log_dir: str = "gnbg_logs",
     target: float = TARGET_ERROR,
+    instances_folder: Optional[str] = None,
 ) -> RunResult:
     """Run one of the three optimizers on one GNBG instance.
 
@@ -1411,6 +1696,10 @@ def solve_gnbg_problem(
     the box bounds. The known optimum is used exclusively for post-hoc error
     logging/target detection, never for search decisions.
     """
+    if problem.max_evals is not None and budget > problem.max_evals:
+        raise ValueError(
+            f"Requested budget {budget} exceeds the GNBG instance MaxEvals={problem.max_evals}"
+        )
     lo, hi = problem.lower, problem.upper
     name = algorithm.strip().lower()
     aliases = {
@@ -1521,6 +1810,7 @@ def run_gnbg_suite(
     log_dir: str = "gnbg_logs",
     summary_csv: str = "gnbg_summary.csv",
     target: float = TARGET_ERROR,
+    instances_folder: Optional[str] = None,
 ) -> list[RunResult]:
     """Run the configured algorithms over official GNBG IDs and write a summary."""
     results: list[RunResult] = []
@@ -1529,7 +1819,7 @@ def run_gnbg_suite(
             for run in range(runs):
                 # Fresh GNBG wrapper per run prevents IOH state from leaking
                 # evaluations/logger state between independent trials.
-                problem = load_gnbg_problem(pid)
+                problem = load_gnbg_problem(pid, instances_folder=instances_folder)
                 result = solve_gnbg_problem(
                     algorithm=algorithm,
                     problem=problem,
@@ -1584,6 +1874,58 @@ def ackley(x: Array) -> float:
     s2 = np.mean(np.cos(c * x))
     return float(-a * np.exp(-b * np.sqrt(s1)) - np.exp(s2) + a + math.e)
 
+
+
+def run_self_test(instances_folder: Optional[str] = None) -> None:
+    """Load GNBG f1, test scalar objective output and the three optimizers.
+
+    This test consumes no official benchmark FE budget because it uses the
+    direct evaluator before creating any logged optimization run.
+    """
+    problem = load_gnbg_problem(1, instances_folder=instances_folder)
+    if problem.optimum_position is None:
+        raise RuntimeError("GNBG optimum position was not loaded")
+    x = reflect_bounds(problem.optimum_position, problem.lower, problem.upper)
+    value = problem.fun(x)
+    if not isinstance(value, (float, np.floating)) or not np.isfinite(float(value)):
+        raise RuntimeError(
+            f"GNBG scalar objective test failed: type={type(value).__name__}, value={value!r}"
+        )
+    print(
+        f"GNBG loader OK: f{problem.problem_id:02d}, dimension={problem.dimension}, "
+        f"raw_optimum={problem.raw_optimum_value:.17g}, shifted_f(optimum_position)={float(value):.3e}"
+    )
+
+    lo, hi = problem.lower, problem.upper
+    center = 0.5 * (lo + hi)
+    test_budget = 32
+
+    opt = BIPOPCMAES(
+        x0=center, sigma0=max(0.05 * float(np.min(hi - lo)), 1e-8),
+        lower=lo, upper=hi, niche_radius=0.15, seed=1,
+    )
+    bx, bf, _ = opt.minimize(problem.fun, test_budget)
+    assert np.all((bx >= lo) & (bx <= hi)) and np.isfinite(bf)
+
+    niche = NicheArchive(lo, hi, radius=0.15, max_size=100)
+    opt = LMCMAES(
+        x0=center, sigma0=max(0.05 * float(np.min(hi - lo)), 1e-8),
+        lam=10, lower=lo, upper=hi, niche=niche, memory=min(8, max(4, problem.dimension // 10 + 2)),
+        seed=1, min_lam=4,
+    )
+    bx, bf, _ = opt.minimize(problem.fun, test_budget)
+    assert np.all((bx >= lo) & (bx <= hi)) and np.isfinite(bf)
+
+    max_pop = max(8, min(20, 4 * problem.dimension))
+    min_pop = max(4, min(8, max_pop // 2))
+    opt = LSHADE(
+        lo, hi, max_pop=max_pop, min_pop=min_pop, H=5,
+        niche_radius=0.15, seed=1,
+    )
+    bx, bf, _ = opt.minimize(problem.fun, test_budget)
+    assert np.all((bx >= lo) & (bx <= hi)) and np.isfinite(bf)
+
+    print("Self-test OK: objective scalar conversion, reflective bounds, and all three optimizers.")
 
 
 # ------------------------------ command line ------------------------------
@@ -1646,6 +1988,10 @@ def main() -> None:
     ap.add_argument("--log-dir", default="gnbg_logs")
     ap.add_argument("--summary", default="gnbg_summary.csv")
     ap.add_argument("--target", type=float, default=TARGET_ERROR)
+    ap.add_argument("--instances-folder", default=None,
+                    help="Directory containing official GNBG fN.mat files; omit to use installed IOHGNBG data.")
+    ap.add_argument("--self-test", action="store_true",
+                    help="Run a small f1 compatibility/optimizer test and exit.")
     args = ap.parse_args()
 
     if args.runs < 1:
@@ -1654,6 +2000,9 @@ def main() -> None:
         ap.error("--budget must be >= 1")
     if args.target <= 0:
         ap.error("--target must be > 0")
+    if args.self_test:
+        run_self_test(instances_folder=args.instances_folder)
+        return
 
     results = run_gnbg_suite(
         algorithms=args.algorithm,
@@ -1664,6 +2013,7 @@ def main() -> None:
         log_dir=args.log_dir,
         summary_csv=args.summary,
         target=args.target,
+        instances_folder=args.instances_folder,
     )
     for r in results:
         target_fe = "FAIL" if r.target_fe is None else str(r.target_fe)

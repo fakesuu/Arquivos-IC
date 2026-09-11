@@ -1,6 +1,8 @@
 import numpy as np
 from collections import defaultdict
 import csv
+import sys
+import os
 
 # ============================================================================
 # 0. Utility: Reflective Bounds
@@ -543,94 +545,159 @@ class NichingOptimizer:
 
 
 # ============================================================================
-# 6. Benchmark helper functions (GNBG optional)
+# 6. GNBG Integration (Official Generator)
 # ============================================================================
+# Attempt to import the official GNBG generator.
+# The file "GNBG.py" from https://github.com/Danial-Yazdani/GNBG_Generator.Python
+# must be placed in the same directory or in PYTHONPATH.
+try:
+    from GNBG import GNBG   # Official class from the generator repository
+    GNBG_AVAILABLE = True
+except ImportError:
+    GNBG_AVAILABLE = False
+    print("Warning: Official GNBG generator not found. Using fallback functions.")
+
 def get_gnbg_problem(index, dim):
     """
-    Placeholder for GNBG. Replace with actual GNBG calls if available.
-    Returns function, bounds, optimum.
+    Return (function, bounds, optimum) for a GNBG problem instance.
+
+    If the official GNBG generator is available, it is used to construct a
+    problem instance. The `index` is used as a seed to ensure reproducible
+    instances.
+
+    Otherwise, falls back to classical functions (NOT GNBG) for continuity.
     """
-    # Example: multimodal functions on [0,1]^D with global minimum 0
-    if index == 1:  # Rastrigin-like
-        def f(x):
-            z = 10 * x - 5
-            return 10 * len(x) + np.sum(z**2 - 10 * np.cos(2 * np.pi * z), axis=0)
-    elif index == 2:  # Griewank-like
-        def f(x):
-            z = 600 * x - 300
-            return 1 + np.sum(z**2)/4000 - np.prod(np.cos(z / np.sqrt(np.arange(1, len(x)+1))))
-    elif index == 3:  # Ackley-like
-        def f(x):
-            z = 2 * x - 1
-            return -20 * np.exp(-0.2 * np.sqrt(np.mean(z**2))) - np.exp(np.mean(np.cos(2*np.pi*z))) + 20 + np.e
+    if GNBG_AVAILABLE:
+        # Create a GNBG instance and configure it.
+        # The official generator uses a class named "GNBG" with attributes
+        # such as NumberOfVariables, MinCoordinate, MaxCoordinate, and a
+        # method "fitness" that evaluates a solution vector.
+        np.random.seed(index)          # reproducible instance per index
+        gnbg = GNBG()
+        gnbg.NumberOfVariables = dim
+        # The generator's default bounds are typically [-100, 100].
+        # We use the instance's own bounds if available.
+        bounds = np.array([gnbg.MinCoordinate, gnbg.MaxCoordinate])
+        # The optimum value for the generated instance is stored in
+        # "gnbg.OptimumValue" (typically 0.0 for GNBG instances).
+        optimum = getattr(gnbg, 'OptimumValue', 0.0)
+        # The fitness method evaluates a single solution vector.
+        f = gnbg.fitness
+        return f, bounds, optimum
     else:
-        def f(x):
-            return np.sum((x - 0.25)**2)
-    return f, np.array([0.0, 1.0]), 0.0
+        # ------------------------------------------------------------------
+        # Fallback: classical functions with their standard bounds (NOT GNBG)
+        # These are provided only for code continuity if the GNBG package
+        # is unavailable. They are NOT GNBG instances.
+        # ------------------------------------------------------------------
+        if index == 1:  # Rastrigin
+            def f(x):
+                return 10 * len(x) + np.sum(x**2 - 10 * np.cos(2 * np.pi * x))
+            bounds = np.array([-5.12, 5.12])
+        elif index == 2:  # Griewank
+            def f(x):
+                return 1 + np.sum(x**2) / 4000 - np.prod(np.cos(x / np.sqrt(np.arange(1, len(x)+1))))
+            bounds = np.array([-600, 600])
+        elif index == 3:  # Ackley
+            def f(x):
+                return -20 * np.exp(-0.2 * np.sqrt(np.mean(x**2))) - np.exp(np.mean(np.cos(2*np.pi*x))) + 20 + np.e
+            bounds = np.array([-32, 32])
+        else:
+            # Default: shifted sphere (placeholder)
+            def f(x):
+                return np.sum((x - 0.25)**2)
+            bounds = np.array([-100, 100])
+        return f, bounds, 0.0
 
 
 # ============================================================================
-# 7. Example Usage: Benchmark one algorithm on a single function
+# 7. Main Execution: 31 Independent Runs per Algorithm & Function
 # ============================================================================
 if __name__ == "__main__":
     # Configuration
     algo_classes = {
         'BIPOP-CMA-ES': BIPOP_CMAES,
-        'LM-CMA-ES': ActiveLM_CMAES,
-        'L-SHADE': Improved_L_SHADE,
+        'LM-CMA-ES':    ActiveLM_CMAES,
+        'L-SHADE':      Improved_L_SHADE,
     }
-    dim = 10
-    max_evals_total = 20000
+
+    dim = 30                     # Default problem dimension (competition setting)
     num_niches = 3
     exclusion_radius = 0.2
     error_threshold = 1e-8
+    num_runs = 31                # Number of independent runs per algorithm/function
+    base_seed = 42
 
-    # Run each algorithm on a sample function (index 1) and log results
+    # GNBG function indices to test (1..24 per competition)
+    function_indices = list(range(1, 25))
+
     for algo_name, algo_class in algo_classes.items():
-        print(f"\n=== {algo_name} ===")
-        f, bounds, optimum = get_gnbg_problem(1, dim)
+        print(f"\n{'='*70}")
+        print(f"=== {algo_name}: {num_runs} runs per function, dim={dim} ===")
+        print(f"{'='*70}")
 
-        # Use lists to allow mutation without nonlocal
-        eval_count = [0]
-        best_err = [np.inf]
-        error_history = []
+        for func_idx in function_indices:
+            # Dynamic evaluation budget per competition specification
+            if 1 <= func_idx <= 15:
+                max_evals_total = 500_000
+            elif 16 <= func_idx <= 24:
+                max_evals_total = 1_000_000
+            else:
+                raise ValueError(f"Invalid GNBG function index: {func_idx}")
 
-        def tracked_func(x):
-            eval_count[0] += 1
-            fval = f(x)
-            if fval < best_err[0]:
-                best_err[0] = fval
-                error_history.append((eval_count[0], fval))
-            return fval
+            print(f"\n--- Function {func_idx} (budget = {max_evals_total:,} evals) ---")
 
-        # Run niching optimizer
-        opt = NichingOptimizer(algo_class, tracked_func, dim, bounds,
-                               max_evals_total, num_niches, exclusion_radius,
-                               seed=42)
-        found_optima, logs = opt.run()
+            success_count = 0
+            best_errors = []
+            evals_to_threshold_list = []
 
-        # Find best solution across niches
-        if found_optima:
-            best_x, best_f = min(found_optima, key=lambda t: t[1])
-        else:
-            best_x, best_f = None, np.inf
+            for run_idx in range(num_runs):
+                run_seed = base_seed + run_idx * 1000 + func_idx
 
-        # Find eval count when threshold reached
-        evals_threshold = None
-        for evals, err in error_history:
-            if err <= error_threshold:
-                evals_threshold = evals
-                break
+                # Load problem instance (GNBG or fallback)
+                f, bounds, optimum = get_gnbg_problem(func_idx, dim)
 
-        print(f"Best error: {best_f:.2e}")
-        print(f"Evals to reach {error_threshold}: {evals_threshold if evals_threshold else 'not reached'}")
-        print(f"Total evals used: {eval_count[0]}")
-        print(f"Logs captured for {len(logs)} generations")
+                eval_count = [0]
+                best_err = [np.inf]
+                error_history = []
 
-        # Save logs to CSV (optional)
-        if logs:
-            with open(f"logs_{algo_name}.csv", 'w', newline='') as f_csv:
-                writer = csv.DictWriter(f_csv, fieldnames=logs[0].keys())
-                writer.writeheader()
-                writer.writerows(logs)
-            print(f"Logs saved to logs_{algo_name}.csv")
+                def tracked_func(x, _eval_count=eval_count, _best_err=best_err,
+                                 _history=error_history, _f=f):
+                    _eval_count[0] += 1
+                    fval = _f(x)
+                    if fval < _best_err[0]:
+                        _best_err[0] = fval
+                        _history.append((_eval_count[0], fval))
+                    return fval
+
+                opt = NichingOptimizer(
+                    algo_class, tracked_func, dim, bounds,
+                    max_evals_total, num_niches, exclusion_radius,
+                    seed=run_seed
+                )
+                found_optima, logs = opt.run()
+
+                if found_optima:
+                    best_x, best_f = min(found_optima, key=lambda t: t[1])
+                else:
+                    best_x, best_f = None, np.inf
+                best_errors.append(best_f)
+
+                if best_f < error_threshold:
+                    success_count += 1
+                    for evals, err in error_history:
+                        if err <= error_threshold:
+                            evals_to_threshold_list.append(evals)
+                            break
+
+            # Aggregated results for this function
+            success_rate = 100.0 * success_count / num_runs
+            avg_best_err = float(np.mean(best_errors))
+            avg_evals = float(np.mean(evals_to_threshold_list)) if evals_to_threshold_list else float('nan')
+
+            print(f"  Success Rate        : {success_rate:.1f}% ({success_count}/{num_runs})")
+            print(f"  Average Best Error  : {avg_best_err:.4e}")
+            if evals_to_threshold_list:
+                print(f"  Avg. Evals to 1e-08 : {avg_evals:.0f} (over {len(evals_to_threshold_list)} runs)")
+            else:
+                print(f"  Avg. Evals to 1e-08 : N/A")

@@ -1,15 +1,14 @@
 import numpy as np
-from collections import defaultdict
-import csv
-import sys
 import os
+import iohgnbg
+
 
 # ============================================================================
 # 0. Utility: Reflective Bounds
 # ============================================================================
 def reflect_bounds(x, lower, upper, max_reflections=10):
     """Reflect coordinates outside [lower, upper] back into the feasible region.
-    
+
     Handles scalar bounds (same for all dimensions) or per-dimension bounds
     by broadcasting them to the shape of `x`.
     """
@@ -34,7 +33,8 @@ def reflect_bounds(x, lower, upper, max_reflections=10):
 # 1. ActiveCMAES (full covariance) with population reduction
 # ============================================================================
 class ActiveCMAES:
-    def __init__(self, func, dim, x0=None, sigma0=0.5, bounds=None, max_evals=10000, seed=None):
+    def __init__(self, func, dim, x0=None, sigma0=0.5, bounds=None,
+                 max_evals=10000, seed=None, lambda_scale=1.0):
         self.func = func
         self.dim = dim
         self.bounds = bounds
@@ -46,9 +46,10 @@ class ActiveCMAES:
             self.xmean = np.array(x0)
         self.sigma = sigma0
 
-        # Initial population size and schedule
-        self.lam_init = 4 + int(3 * np.log(dim))
-        self.lam_min = 4
+        # Initial population size and schedule (scaled by lambda_scale for BIPOP)
+        base_lam = 4 + int(3 * np.log(dim))
+        self.lam_init = max(4, int(round(base_lam * lambda_scale)))
+        self.lam_min = max(4, self.lam_init // 2)
         self.lam = self.lam_init
         self._update_strategy_parameters()
 
@@ -190,13 +191,15 @@ class BIPOP_CMAES:
         restart = 0
         sigma0 = 0.5
         while self.evals_used < self.max_evals and restart < 30:
+            # BIPOP alternates between small (factor=1) and large (factor=2) populations
             factor = 1 if restart % 2 == 0 else 2
             budget = min(self.max_evals - self.evals_used, int(100 * self.dim * (restart + 1)))
             if budget <= 0:
                 break
             x0 = self.rng.uniform(self.bounds[0], self.bounds[1], size=self.dim) if self.bounds is not None else self.rng.randn(self.dim)
             cma = ActiveCMAES(self.func, self.dim, x0=x0, sigma0=sigma0, bounds=self.bounds,
-                              max_evals=budget, seed=self.rng.randint(0, 1e6))
+                              max_evals=budget, seed=self.rng.randint(0, 1e6),
+                              lambda_scale=factor)
             x, f, logs = cma.run()
             self.evals_used += budget
             if f < self.best_f:
@@ -545,69 +548,83 @@ class NichingOptimizer:
 
 
 # ============================================================================
-# 6. GNBG Integration (Official Generator)
+# 6. GNBG Integration (Official iohgnbg package)
 # ============================================================================
-# Attempt to import the official GNBG generator.
-# The file "GNBG.py" from https://github.com/Danial-Yazdani/GNBG_Generator.Python
-# must be placed in the same directory or in PYTHONPATH.
-try:
-    from GNBG import GNBG   # Official class from the generator repository
-    GNBG_AVAILABLE = True
-except ImportError:
-    GNBG_AVAILABLE = False
-    print("Warning: Official GNBG generator not found. Using fallback functions.")
-
 def get_gnbg_problem(index, dim):
     """
-    Return (function, bounds, optimum) for a GNBG problem instance.
+    Return (function, bounds, optimum) for a GNBG benchmark problem
+    using the official iohgnbg package.
 
-    If the official GNBG generator is available, it is used to construct a
-    problem instance. The `index` is used as a seed to ensure reproducible
-    instances.
+    Parameters
+    ----------
+    index : int
+        GNBG function id (1..24).
+    dim : int
+        Problem dimension (used for reference; the actual dimension is
+        determined by the instance file).
 
-    Otherwise, falls back to classical functions (NOT GNBG) for continuity.
+    Returns
+    -------
+    f : callable
+        Callable objective function, f(x) -> float.
+    bounds : np.ndarray of shape (2,)
+        [lower, upper] bounds.
+    optimum : float
+        Known optimal function value (typically 0.0 for GNBG).
     """
-    if GNBG_AVAILABLE:
-        # Create a GNBG instance and configure it.
-        # The official generator uses a class named "GNBG" with attributes
-        # such as NumberOfVariables, MinCoordinate, MaxCoordinate, and a
-        # method "fitness" that evaluates a solution vector.
-        np.random.seed(index)          # reproducible instance per index
-        gnbg = GNBG()
-        gnbg.NumberOfVariables = dim
-        # The generator's default bounds are typically [-100, 100].
-        # We use the instance's own bounds if available.
-        bounds = np.array([gnbg.MinCoordinate, gnbg.MaxCoordinate])
-        # The optimum value for the generated instance is stored in
-        # "gnbg.OptimumValue" (typically 0.0 for GNBG instances).
-        optimum = getattr(gnbg, 'OptimumValue', 0.0)
-        # The fitness method evaluates a single solution vector.
-        f = gnbg.fitness
-        return f, bounds, optimum
-    else:
-        # ------------------------------------------------------------------
-        # Fallback: classical functions with their standard bounds (NOT GNBG)
-        # These are provided only for code continuity if the GNBG package
-        # is unavailable. They are NOT GNBG instances.
-        # ------------------------------------------------------------------
-        if index == 1:  # Rastrigin
-            def f(x):
-                return 10 * len(x) + np.sum(x**2 - 10 * np.cos(2 * np.pi * x))
-            bounds = np.array([-5.12, 5.12])
-        elif index == 2:  # Griewank
-            def f(x):
-                return 1 + np.sum(x**2) / 4000 - np.prod(np.cos(x / np.sqrt(np.arange(1, len(x)+1))))
-            bounds = np.array([-600, 600])
-        elif index == 3:  # Ackley
-            def f(x):
-                return -20 * np.exp(-0.2 * np.sqrt(np.mean(x**2))) - np.exp(np.mean(np.cos(2*np.pi*x))) + 20 + np.e
-            bounds = np.array([-32, 32])
-        else:
-            # Default: shifted sphere (placeholder)
-            def f(x):
-                return np.sum((x - 0.25)**2)
-            bounds = np.array([-100, 100])
-        return f, bounds, 0.0
+    # Locate the folder containing the GNBG .mat instance files
+    # inside the iohgnbg package installation.
+    pkg_dir = os.path.dirname(iohgnbg.__file__)
+    instances_folder = None
+    for root, dirs, files in os.walk(pkg_dir):
+        if any(f.endswith('.mat') for f in files):
+            instances_folder = root
+            break
+
+    if instances_folder is None:
+        raise RuntimeError(
+            "Could not find GNBG instance files (.mat) inside the "
+            "iohgnbg package. Please download the GNBG instances "
+            "and provide the path manually."
+        )
+
+    # Create the IOH GNBG problem instance.
+    problem = iohgnbg.get_problem(index, instances_folder)
+
+    # IOH problem objects are directly callable: problem(x) -> float
+    f = problem
+
+    # Extract bounds.
+    try:
+        lb = np.asarray(problem.bounds.lb)
+        ub = np.asarray(problem.bounds.ub)
+        lower = float(lb[0])
+        upper = float(ub[0])
+    except AttributeError:
+        try:
+            first = list(problem.bounds)[0]
+            lower = float(first[0])
+            upper = float(first[1])
+        except Exception:
+            lower, upper = -100.0, 100.0
+    bounds = np.array([lower, upper])
+
+    # Extract optimal value.
+    try:
+        optimum = float(problem.optimum.y)
+    except (AttributeError, TypeError):
+        optimum = 0.0
+
+    # Inform the user of the actual problem dimension.
+    try:
+        actual_dim = problem.dimension
+        if actual_dim != dim:
+            print(f"  [Info] GNBG instance f{index} has dimension "
+                  f"{actual_dim} (requested {dim}). Using {actual_dim}.")
+    except AttributeError:
+        pass
+
+    return f, bounds, optimum
 
 
 # ============================================================================
@@ -654,7 +671,7 @@ if __name__ == "__main__":
             for run_idx in range(num_runs):
                 run_seed = base_seed + run_idx * 1000 + func_idx
 
-                # Load problem instance (GNBG or fallback)
+                # Load problem instance (GNBG via iohgnbg)
                 f, bounds, optimum = get_gnbg_problem(func_idx, dim)
 
                 eval_count = [0]
@@ -700,4 +717,4 @@ if __name__ == "__main__":
             if evals_to_threshold_list:
                 print(f"  Avg. Evals to 1e-08 : {avg_evals:.0f} (over {len(evals_to_threshold_list)} runs)")
             else:
-                print(f"  Avg. Evals to 1e-08 : N/A")
+                print("  Avg. Evals to 1e-08 : N/A")

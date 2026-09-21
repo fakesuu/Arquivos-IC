@@ -867,12 +867,21 @@ if __name__ == "__main__":
             # ---- Console summary ----
             success_rate = 100.0 * success_count / num_runs
             avg_best_err = float(np.mean(best_errors))
+            std_best_err = float(np.std(best_errors))
+            min_best_err = float(np.min(best_errors))
+            max_best_err = float(np.max(best_errors))
+        
             avg_evals = float(np.mean(evals_to_threshold_list)) if evals_to_threshold_list else float('nan')
 
             print(f"  Success Rate        : {success_rate:.1f}% ({success_count}/{num_runs})")
-            print(f"  Average Best Error  : {avg_best_err:.4e}")
+            print(f"  Average Best Error  : {avg_best_err:.4e} ± {std_best_err:.4e}")
+            print(f"  Best / Worst Error  : {min_best_err:.4e} / {max_best_err:.4e}")
+        
             if evals_to_threshold_list:
-                print(f"  Avg. Evals to 1e-08 : {avg_evals:.0f} (over {len(evals_to_threshold_list)} runs)")
+                std_evals = float(np.std(evals_to_threshold_list))
+                median_evals = float(np.median(evals_to_threshold_list))
+                print(f"  Avg. Evals to 1e-08 : {avg_evals:.0f} ± {std_evals:.0f} (over {len(evals_to_threshold_list)} runs)")
+                print(f"  Median Evals        : {median_evals:.0f}")
             else:
                 print("  Avg. Evals to 1e-08 : N/A")
 

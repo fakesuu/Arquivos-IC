@@ -1,22 +1,42 @@
 import numpy as np
 import os
+import csv
 import iohgnbg
 
+# ============================================================================
+# Workaround: iohgnbg.gnbg_problem.GNBG.fitness returns a numpy array even
+# for single-point evaluations. IOH's C-level wrapper expects a Python
+# scalar and raises:
+#     SystemError: ... returned a result with an exception set
+#     TypeError: only length-1 arrays can be converted to Python scalars
+#
+# This monkeypatch wraps GNBG.fitness so that single-point evaluations
+# return a Python float, and multi-point evaluations return a 1-D numpy
+# array. The input shape is left untouched so the original broadcasting
+# semantics (which expect a flat (dim,) vector) are preserved.
+# ============================================================================
+from iohgnbg.gnbg_problem import GNBG as _GNBG
+
+if not getattr(_GNBG.fitness, "_is_dim_fixed", False):
+    _original_gnbg_fitness = _GNBG.fitness
+
+    def _gnbg_fitness_fixed(self, X):
+        result = _original_gnbg_fitness(self, X)
+        arr = np.asarray(result, dtype=float).ravel()
+        if arr.size == 1:
+            return float(arr[0])
+        return arr
+
+    _gnbg_fitness_fixed._is_dim_fixed = True
+    _GNBG.fitness = _gnbg_fitness_fixed
 
 # ============================================================================
 # 0. Utility: Reflective Bounds
 # ============================================================================
 def reflect_bounds(x, lower, upper, max_reflections=10):
-    """Reflect coordinates outside [lower, upper] back into the feasible region.
-
-    Handles scalar bounds (same for all dimensions) or per-dimension bounds
-    by broadcasting them to the shape of `x`.
-    """
     x = np.array(x, copy=True)
-    # Broadcast bounds to match the shape of x
     lower = np.broadcast_to(lower, x.shape)
     upper = np.broadcast_to(upper, x.shape)
-
     for _ in range(max_reflections):
         mask_low = x < lower
         mask_high = x > upper
@@ -24,8 +44,6 @@ def reflect_bounds(x, lower, upper, max_reflections=10):
             break
         x[mask_low] = 2 * lower[mask_low] - x[mask_low]
         x[mask_high] = 2 * upper[mask_high] - x[mask_high]
-
-    # Final safety clip (should rarely be needed)
     return np.clip(x, lower, upper)
 
 
@@ -46,7 +64,6 @@ class ActiveCMAES:
             self.xmean = np.array(x0)
         self.sigma = sigma0
 
-        # Initial population size and schedule (scaled by lambda_scale for BIPOP)
         base_lam = 4 + int(3 * np.log(dim))
         self.lam_init = max(4, int(round(base_lam * lambda_scale)))
         self.lam_min = max(4, self.lam_init // 2)
@@ -61,22 +78,17 @@ class ActiveCMAES:
         self.count_evals = 0
         self.best_x = None
         self.best_f = np.inf
-        self.logs = []   # per-generation info
+        self.logs = []
 
     def _update_strategy_parameters(self):
-        """Recompute weights and learning rates based on current lambda."""
         self.mu = self.lam // 2
         self.weights = np.log(self.mu + 0.5) - np.log(np.arange(1, self.mu + 1))
         self.weights /= np.sum(self.weights)
         self.mueff = 1.0 / np.sum(self.weights ** 2)
-
-        # Negative weights for active update (uniform, sum to -1)
-        self.mu_neg = self.lam - self.mu          # number of negative weights
+        self.mu_neg = self.lam - self.mu
         neg_weights = -np.ones(self.mu_neg) / self.mu_neg
         self.weights_full = np.concatenate([self.weights, neg_weights])
         self.mueff_neg = 1.0 / np.sum(self.weights_full ** 2) - self.mueff
-
-        # Learning rates
         self.cc = (4 + self.mueff / self.dim) / (self.dim + 4 + 2 * self.mueff / self.dim)
         self.cs = (self.mueff + 2) / (self.dim + self.mueff + 5)
         self.c1 = 2 / ((self.dim + 1.3) ** 2 + self.mueff)
@@ -107,24 +119,19 @@ class ActiveCMAES:
             self.best_f = arf[0]
             self.best_x = arx[0].copy()
 
-        # Success rate relative to parent (xmean)
         parent_f = self.func(self.xmean)
         success = np.sum(arf < parent_f) / self.lam
 
-        # Weighted recombination (positive and negative weights)
         self.xmean = np.sum(self.weights_full[:, None] * arx, axis=0)
         ymean_pos = np.sum(self.weights[:, None] * ary[:self.mu], axis=0)
         ymean_neg = np.sum(self.weights_full[self.mu:, None] * ary[self.mu:], axis=0)
         zmean = np.sum(self.weights[:, None] * arz[:self.mu], axis=0)
 
-        # Step-size adaptation
         self.ps = (1 - self.cs) * self.ps + np.sqrt(self.cs * (2 - self.cs) * self.mueff) * zmean
-        # Avoid division by zero when count_evals = 0
         denom = np.sqrt(max(1e-12, 1 - (1 - self.cs) ** (2 * self.count_evals / self.lam)))
         hsig = (np.linalg.norm(self.ps) / denom / np.sqrt(self.dim) * 1.4) < 1.0
         self.pc = (1 - self.cc) * self.pc + hsig * np.sqrt(self.cc * (2 - self.cc) * self.mueff) * ymean_pos
 
-        # Active covariance update
         C_pos = (1 - self.c1 - self.cmu) * self.C + \
                 self.c1 * (np.outer(self.pc, self.pc) + (1 - hsig) * self.cc * (2 - self.cc) * self.C)
         for i in range(self.mu):
@@ -147,7 +154,6 @@ class ActiveCMAES:
 
         self.count_evals += self.lam
 
-        # Log generation info
         self.logs.append({
             'gen': len(self.logs),
             'evals': self.count_evals,
@@ -159,7 +165,6 @@ class ActiveCMAES:
             'condition': np.max(self.D) / np.min(self.D) if np.min(self.D) > 0 else np.inf
         })
 
-        # Reduce population for next generation
         self._reduce_population()
 
     def run(self):
@@ -173,7 +178,7 @@ class ActiveCMAES:
 
 
 # ============================================================================
-# 2. BIPOP-CMA-ES wrapper with restarts and sigma scaling
+# 2. BIPOP-CMA-ES wrapper
 # ============================================================================
 class BIPOP_CMAES:
     def __init__(self, func, dim, bounds, max_evals, seed=None):
@@ -185,13 +190,12 @@ class BIPOP_CMAES:
         self.best_x = None
         self.best_f = np.inf
         self.evals_used = 0
-        self.all_logs = []   # aggregated logs from all restarts
+        self.all_logs = []
 
     def run(self):
         restart = 0
         sigma0 = 0.5
         while self.evals_used < self.max_evals and restart < 30:
-            # BIPOP alternates between small (factor=1) and large (factor=2) populations
             factor = 1 if restart % 2 == 0 else 2
             budget = min(self.max_evals - self.evals_used, int(100 * self.dim * (restart + 1)))
             if budget <= 0:
@@ -205,11 +209,9 @@ class BIPOP_CMAES:
             if f < self.best_f:
                 self.best_f = f
                 self.best_x = x
-            # Aggregate logs
             for log in logs:
                 log['restart'] = restart
                 self.all_logs.append(log)
-            # Success-based sigma scaling for next restart
             avg_success = np.mean([log['success_rate'] for log in logs]) if logs else 0.5
             if avg_success > 0.5:
                 sigma0 = min(sigma0 * 2.0, 2.0)
@@ -253,13 +255,10 @@ class ActiveLM_CMAES:
         self.weights = np.log(self.mu + 0.5) - np.log(np.arange(1, self.mu + 1))
         self.weights /= np.sum(self.weights)
         self.mueff = 1.0 / np.sum(self.weights ** 2)
-
-        # Negative weights for active update (uniform, sum to -1)
-        self.mu_neg = self.lam - self.mu          # number of negative weights
+        self.mu_neg = self.lam - self.mu
         neg_weights = -np.ones(self.mu_neg) / self.mu_neg
         self.weights_full = np.concatenate([self.weights, neg_weights])
         self.mueff_neg = 1.0 / np.sum(self.weights_full ** 2) - self.mueff
-
         self.cc = (4 + self.mueff / self.dim) / (self.dim + 4 + 2 * self.mueff / self.dim)
         self.cs = (self.mueff + 2) / (self.dim + self.mueff + 5)
         self.c1 = 2 / ((self.dim + 1.3) ** 2 + self.mueff)
@@ -297,12 +296,10 @@ class ActiveLM_CMAES:
         zmean = np.sum(self.weights[:, None] * arz[:self.mu], axis=0)
 
         self.ps = (1 - self.cs) * self.ps + np.sqrt(self.cs * (2 - self.cs) * self.mueff) * zmean
-        # Avoid division by zero when count_evals = 0
         denom = np.sqrt(max(1e-12, 1 - (1 - self.cs) ** (2 * self.count_evals / self.lam)))
         hsig = (np.linalg.norm(self.ps) / denom / np.sqrt(self.dim) * 1.4) < 1.0
         self.pc = (1 - self.cc) * self.pc + hsig * np.sqrt(self.cc * (2 - self.cc) * self.mueff) * ymean_pos
 
-        # Success-based adjustment of learning rates
         if success > 0.5:
             self.c1 = min(0.9, self.c1 * 1.1)
             self.cmu = max(0.01, self.cmu * 0.9)
@@ -310,7 +307,6 @@ class ActiveLM_CMAES:
             self.c1 = max(0.01, self.c1 * 0.9)
             self.cmu = min(0.9, self.cmu * 1.1)
 
-        # Active diagonal update
         C_pos = (1 - self.c1 - self.cmu) * self.C_diag + \
                 self.c1 * (self.pc ** 2 + (1 - hsig) * self.cc * (2 - self.cc) * self.C_diag)
         for i in range(self.mu):
@@ -351,7 +347,7 @@ class ActiveLM_CMAES:
 
 
 # ============================================================================
-# 4. Improved L-SHADE with population size reduction and logging
+# 4. Improved L-SHADE
 # ============================================================================
 class Improved_L_SHADE:
     def __init__(self, func, dim, bounds, max_evals, pop_size=None, seed=None):
@@ -360,11 +356,9 @@ class Improved_L_SHADE:
         self.bounds = bounds
         self.max_evals = max_evals
         self.rng = np.random.RandomState(seed)
-
         self.N_init = pop_size if pop_size is not None else 100
         self.N = self.N_init
         self.N_min = 4
-
         self.F = 0.5
         self.CR = 0.5
         self.H = 5
@@ -406,7 +400,6 @@ class Improved_L_SHADE:
             xr2 = self.pop[self.rng.randint(self.N)]
             while np.array_equal(xr2, self.pop[idx]) or np.array_equal(xr2, xr1):
                 xr2 = self.pop[self.rng.randint(self.N)]
-        # Use standard_cauchy instead of cauchy
         if self.rng.rand() < 0.5:
             F = self.rng.normal(self.F, 0.1)
         else:
@@ -442,7 +435,6 @@ class Improved_L_SHADE:
             for i in range(self.N):
                 old_f = self.fitness[i]
                 mutant, F = self._mutate(i)
-                # Use standard_cauchy instead of cauchy
                 if self.rng.rand() < 0.5:
                     CR = self.rng.normal(self.M_CR[self.mem_idx], 0.1)
                 else:
@@ -491,7 +483,6 @@ class Improved_L_SHADE:
                 'success_rate': success_rate
             })
 
-            # Linear population size reduction
             self.N = max(self.N_min, int(round(self.N_init - (self.N_init - self.N_min) * self.count_evals / self.max_evals)))
             if self.N < len(self.pop):
                 idx = np.argsort(self.fitness)[:self.N]
@@ -501,7 +492,7 @@ class Improved_L_SHADE:
 
 
 # ============================================================================
-# 5. Niching Wrapper (sequential optimizations with exclusion radius)
+# 5. Niching Wrapper
 # ============================================================================
 class NichingOptimizer:
     def __init__(self, optimizer_class, func, dim, bounds, max_evals_total,
@@ -531,7 +522,6 @@ class NichingOptimizer:
                                        **self.optimizer_kwargs)
             x, f, logs = opt.run()
             self.total_evals += budget
-
             too_close = False
             for prev_x, _ in self.found_optima:
                 if np.linalg.norm(x - prev_x) < self.exclusion_radius:
@@ -539,7 +529,6 @@ class NichingOptimizer:
                     break
             if not too_close:
                 self.found_optima.append((x, f))
-            # Tag and store logs
             for log in logs:
                 log['niche'] = niche_idx
                 self.all_logs.append(log)
@@ -552,100 +541,231 @@ class NichingOptimizer:
 # ============================================================================
 def get_gnbg_problem(index, dim):
     """
-    Return (function, bounds, optimum) for a GNBG benchmark problem
-    using the official iohgnbg package.
+    Return (function, bounds, optimum, actual_dim) for a GNBG benchmark
+    problem using the official iohgnbg package.
 
-    Parameters
-    ----------
-    index : int
-        GNBG function id (1..24).
-    dim : int
-        Problem dimension (used for reference; the actual dimension is
-        determined by the instance file).
-
-    Returns
-    -------
-    f : callable
-        Callable objective function, f(x) -> float.
-    bounds : np.ndarray of shape (2,)
-        [lower, upper] bounds.
-    optimum : float
-        Known optimal function value (typically 0.0 for GNBG).
+    Uses documented IOH attributes:
+      - problem.bounds.lb / problem.bounds.ub   (RealBounds)
+      - problem.optimum.y                        (Optimum)
+      - problem.meta_data.n_variables            (problem dimension)
     """
-    # Locate the folder containing the GNBG .mat instance files
-    # inside the iohgnbg package installation.
     pkg_dir = os.path.dirname(iohgnbg.__file__)
     instances_folder = None
-    for root, dirs, files in os.walk(pkg_dir):
-        if any(f.endswith('.mat') for f in files):
+    for root, _, files in os.walk(pkg_dir):
+        if any(fname.endswith(".mat") for fname in files):
             instances_folder = root
             break
 
     if instances_folder is None:
         raise RuntimeError(
             "Could not find GNBG instance files (.mat) inside the "
-            "iohgnbg package. Please download the GNBG instances "
-            "and provide the path manually."
+            "iohgnbg package installation."
         )
 
-    # Create the IOH GNBG problem instance.
     problem = iohgnbg.get_problem(index, instances_folder)
-
-    # IOH problem objects are directly callable: problem(x) -> float
     f = problem
+    bounds = np.array([float(problem.bounds.lb[0]), float(problem.bounds.ub[0])])
+    optimum = float(problem.optimum.y)
+    actual_dim = int(problem.meta_data.n_variables)
 
-    # Extract bounds.
-    try:
-        lb = np.asarray(problem.bounds.lb)
-        ub = np.asarray(problem.bounds.ub)
-        lower = float(lb[0])
-        upper = float(ub[0])
-    except AttributeError:
-        try:
-            first = list(problem.bounds)[0]
-            lower = float(first[0])
-            upper = float(first[1])
-        except Exception:
-            lower, upper = -100.0, 100.0
-    bounds = np.array([lower, upper])
+    if actual_dim != dim:
+        print(f"  [Info] GNBG instance f{index} has dimension "
+              f"{actual_dim} (requested {dim}). Using {actual_dim}.")
 
-    # Extract optimal value.
-    try:
-        optimum = float(problem.optimum.y)
-    except (AttributeError, TypeError):
-        optimum = 0.0
-
-    # Inform the user of the actual problem dimension.
-    try:
-        actual_dim = problem.dimension
-        if actual_dim != dim:
-            print(f"  [Info] GNBG instance f{index} has dimension "
-                  f"{actual_dim} (requested {dim}). Using {actual_dim}.")
-    except AttributeError:
-        pass
-
-    return f, bounds, optimum
+    return f, bounds, optimum, actual_dim
 
 
 # ============================================================================
-# 7. Main Execution: 31 Independent Runs per Algorithm & Function
+# 7. CSV Logging Utilities (GECCO-compliant format)
+# ============================================================================
+def _ensure_dir(path):
+    """Create directory if it does not exist."""
+    if not os.path.exists(path):
+        os.makedirs(path, exist_ok=True)
+
+
+def log_run_summary(output_dir, algo_name, func_idx, run_idx, seed,
+                    best_error, evals_to_threshold, success,
+                    actual_dim, bounds, optimum, total_evals):
+    """
+    Append a per-run summary to <output_dir>/<algo_name>_summary.csv.
+
+    Columns follow the GECCO competition convention:
+      algorithm, function, run, seed, dimension, lower_bound, upper_bound,
+      optimum, best_error, evals_to_threshold, success, total_evals
+    """
+    _ensure_dir(output_dir)
+    csv_path = os.path.join(output_dir, f"{algo_name}_summary.csv")
+    file_exists = os.path.isfile(csv_path)
+
+    with open(csv_path, "a", newline="") as fh:
+        writer = csv.writer(fh)
+        if not file_exists:
+            writer.writerow([
+                "algorithm", "function", "run", "seed", "dimension",
+                "lower_bound", "upper_bound", "optimum",
+                "best_error", "evals_to_threshold", "success", "total_evals"
+            ])
+        writer.writerow([
+            algo_name, func_idx, run_idx, seed, actual_dim,
+            float(bounds[0]), float(bounds[1]), optimum,
+            float(best_error),
+            int(evals_to_threshold) if evals_to_threshold is not None else -1,
+            int(bool(success)),
+            int(total_evals)
+        ])
+
+
+def log_run_params(output_dir, algo_name, func_idx, run_idx, best_x):
+    """
+    Append the best-found parameter vector of a run to
+    <output_dir>/<algo_name>_params.csv.
+
+    Columns: algorithm, function, run, x0, x1, ..., x_{d-1}
+    """
+    _ensure_dir(output_dir)
+    csv_path = os.path.join(output_dir, f"{algo_name}_params.csv")
+    file_exists = os.path.isfile(csv_path)
+
+    if best_x is None:
+        best_x = np.full(1, np.nan)
+    best_x = np.asarray(best_x).ravel()
+
+    with open(csv_path, "a", newline="") as fh:
+        writer = csv.writer(fh)
+        if not file_exists:
+            header = ["algorithm", "function", "run"] + [f"x{i}" for i in range(len(best_x))]
+            writer.writerow(header)
+        writer.writerow([algo_name, func_idx, run_idx] + [float(v) for v in best_x])
+
+
+def log_generations(output_dir, algo_name, func_idx, run_idx, logs):
+    """
+    Write per-generation logs for a single run to
+    <output_dir>/<algo_name>_generations_f{func_idx}_run{run_idx}.csv.
+
+    The column set is the union of all keys present across the run's log
+    dictionaries (CMA-ES and L-SHADE emit different operator fields).
+    """
+    if not logs:
+        return
+    _ensure_dir(output_dir)
+    csv_path = os.path.join(
+        output_dir,
+        f"{algo_name}_generations_f{func_idx}_run{run_idx}.csv"
+    )
+
+    # Union of keys, preserving insertion order
+    fieldnames = []
+    for entry in logs:
+        for k in entry.keys():
+            if k not in fieldnames:
+                fieldnames.append(k)
+
+    with open(csv_path, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for entry in logs:
+            writer.writerow(entry)
+
+
+def log_combined_results(output_dir, algo_name, records):
+    """
+    Write a combined IOH-compatible CSV for a whole (algorithm, function)
+    experiment. Columns follow the IOH data format:
+      evaluation_counter, function_value, function_id, algorithm_id,
+      problem_dimension, run_id
+    See https://iohprofiler.github.io/IOHanalyzer/data/ for the spec.
+    """
+    if not records:
+        return
+    _ensure_dir(output_dir)
+    csv_path = os.path.join(
+        output_dir, f"{algo_name}_combined.csv"
+    )
+    file_exists = os.path.isfile(csv_path)
+
+    with open(csv_path, "a", newline="") as fh:
+        writer = csv.writer(fh)
+        if not file_exists:
+            writer.writerow([
+                "evaluation_counter", "function_value",
+                "function_id", "algorithm_id",
+                "problem_dimension", "run_id"
+            ])
+        writer.writerows(records)
+
+
+def log_function_statistics(output_dir, algo_name, func_idx,
+                            success_count, num_runs,
+                            best_errors, evals_to_threshold_list,
+                            max_evals_total):
+    """
+    Append aggregate statistics for one (algorithm, function) pair to
+    <output_dir>/<algo_name>_statistics.csv.
+
+    Columns:
+      algorithm, function, runs, budget, success_count, success_rate,
+      mean_best_error, std_best_error, min_best_error, max_best_error,
+      median_evals, mean_evals, std_evals
+    """
+    _ensure_dir(output_dir)
+    csv_path = os.path.join(output_dir, f"{algo_name}_statistics.csv")
+    file_exists = os.path.isfile(csv_path)
+
+    best_errors = np.asarray(best_errors, dtype=float)
+    if evals_to_threshold_list:
+        ev = np.asarray(evals_to_threshold_list, dtype=float)
+        median_evals = float(np.median(ev))
+        mean_evals = float(np.mean(ev))
+        std_evals = float(np.std(ev))
+    else:
+        median_evals = float("nan")
+        mean_evals = float("nan")
+        std_evals = float("nan")
+
+    with open(csv_path, "a", newline="") as fh:
+        writer = csv.writer(fh)
+        if not file_exists:
+            writer.writerow([
+                "algorithm", "function", "runs", "budget",
+                "success_count", "success_rate",
+                "mean_best_error", "std_best_error",
+                "min_best_error", "max_best_error",
+                "median_evals", "mean_evals", "std_evals"
+            ])
+        writer.writerow([
+            algo_name, func_idx, num_runs, max_evals_total,
+            success_count, 100.0 * success_count / num_runs,
+            float(np.mean(best_errors)),
+            float(np.std(best_errors)),
+            float(np.min(best_errors)),
+            float(np.max(best_errors)),
+            median_evals, mean_evals, std_evals
+        ])
+
+
+# ============================================================================
+# 8. Main Execution: 31 Independent Runs per Algorithm & Function
 # ============================================================================
 if __name__ == "__main__":
-    # Configuration
     algo_classes = {
         'BIPOP-CMA-ES': BIPOP_CMAES,
         'LM-CMA-ES':    ActiveLM_CMAES,
         'L-SHADE':      Improved_L_SHADE,
     }
 
-    dim = 30                     # Default problem dimension (competition setting)
+    dim = 30
     num_niches = 3
     exclusion_radius = 0.2
     error_threshold = 1e-8
-    num_runs = 31                # Number of independent runs per algorithm/function
+    num_runs = 31
     base_seed = 42
 
-    # GNBG function indices to test (1..24 per competition)
+    # Root folder for all CSV output
+    output_root = os.path.join(os.getcwd(), "gnbg_results")
+    _ensure_dir(output_root)
+
     function_indices = list(range(1, 25))
 
     for algo_name, algo_class in algo_classes.items():
@@ -653,8 +773,10 @@ if __name__ == "__main__":
         print(f"=== {algo_name}: {num_runs} runs per function, dim={dim} ===")
         print(f"{'='*70}")
 
+        algo_output_dir = os.path.join(output_root, algo_name)
+        _ensure_dir(algo_output_dir)
+
         for func_idx in function_indices:
-            # Dynamic evaluation budget per competition specification
             if 1 <= func_idx <= 15:
                 max_evals_total = 500_000
             elif 16 <= func_idx <= 24:
@@ -667,12 +789,12 @@ if __name__ == "__main__":
             success_count = 0
             best_errors = []
             evals_to_threshold_list = []
+            combined_records = []
 
             for run_idx in range(num_runs):
                 run_seed = base_seed + run_idx * 1000 + func_idx
 
-                # Load problem instance (GNBG via iohgnbg)
-                f, bounds, optimum = get_gnbg_problem(func_idx, dim)
+                f, bounds, optimum, actual_dim = get_gnbg_problem(func_idx, dim)
 
                 eval_count = [0]
                 best_err = [np.inf]
@@ -688,7 +810,7 @@ if __name__ == "__main__":
                     return fval
 
                 opt = NichingOptimizer(
-                    algo_class, tracked_func, dim, bounds,
+                    algo_class, tracked_func, actual_dim, bounds,
                     max_evals_total, num_niches, exclusion_radius,
                     seed=run_seed
                 )
@@ -700,14 +822,49 @@ if __name__ == "__main__":
                     best_x, best_f = None, np.inf
                 best_errors.append(best_f)
 
+                evals_to_threshold = None
                 if best_f < error_threshold:
                     success_count += 1
                     for evals, err in error_history:
                         if err <= error_threshold:
+                            evals_to_threshold = evals
                             evals_to_threshold_list.append(evals)
                             break
 
-            # Aggregated results for this function
+                # ---- CSV: per-run summary ----
+                log_run_summary(
+                    algo_output_dir, algo_name, func_idx, run_idx,
+                    run_seed, best_f, evals_to_threshold,
+                    best_f < error_threshold, actual_dim, bounds,
+                    optimum, eval_count[0]
+                )
+
+                # ---- CSV: per-run best parameter vector ----
+                log_run_params(algo_output_dir, algo_name, func_idx,
+                               run_idx, best_x)
+
+                # ---- CSV: per-generation operator probabilities ----
+                log_generations(algo_output_dir, algo_name, func_idx,
+                                run_idx, logs)
+
+                # ---- Collect IOH-compatible records ----
+                for evals, err in error_history:
+                    combined_records.append([
+                        int(evals), float(err), int(func_idx),
+                        algo_name, int(actual_dim), int(run_idx)
+                    ])
+
+            # ---- CSV: aggregate statistics for this function ----
+            log_function_statistics(
+                algo_output_dir, algo_name, func_idx,
+                success_count, num_runs, best_errors,
+                evals_to_threshold_list, max_evals_total
+            )
+
+            # ---- CSV: combined IOH-compatible records ----
+            log_combined_results(algo_output_dir, algo_name, combined_records)
+
+            # ---- Console summary ----
             success_rate = 100.0 * success_count / num_runs
             avg_best_err = float(np.mean(best_errors))
             avg_evals = float(np.mean(evals_to_threshold_list)) if evals_to_threshold_list else float('nan')
@@ -718,3 +875,5 @@ if __name__ == "__main__":
                 print(f"  Avg. Evals to 1e-08 : {avg_evals:.0f} (over {len(evals_to_threshold_list)} runs)")
             else:
                 print("  Avg. Evals to 1e-08 : N/A")
+
+    print(f"\nAll CSV logs written to: {output_root}")

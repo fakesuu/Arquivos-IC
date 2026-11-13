@@ -1,6 +1,7 @@
 import numpy as np
 from collections import defaultdict
 import csv
+import os
 
 # ============================================================================
 # 0. Utility: Reflective Bounds
@@ -595,7 +596,12 @@ if __name__ == "__main__":
         2: 'Griewank-like',
         3: 'Ackley-like',
         4: 'Sphere-like',
+        
     }
+    
+    # Pasta pra exportar os logs
+    log_dir = "Logs"
+    os.makedirs(log_dir, exist_ok=True)
 
     for algo_name, algo_class in algo_classes.items():
         print(f"\n{'=' * 72}")
@@ -663,9 +669,16 @@ if __name__ == "__main__":
 
                 #  Save per-run CSV
                 if logs:
-                    fname = f"logs_{algo_name}_{func_name}_run{run_idx + 1}.csv"
+                    fname = os.path.join(
+                        log_dir,
+                        f"logs_{algo_name}_{func_name}_run{run_idx + 1}.csv",
+                    )
                     with open(fname, 'w', newline='') as f_csv:
-                        writer = csv.DictWriter(f_csv, fieldnames=logs[0].keys())
+                        writer = csv.DictWriter(
+                            f_csv,
+                            fieldnames=logs[0].keys(),
+                            delimiter=';',
+                        )
                         writer.writeheader()
                         writer.writerows(logs)
 

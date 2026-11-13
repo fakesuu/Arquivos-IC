@@ -570,7 +570,7 @@ def get_gnbg_problem(index, dim):
 
 
 # ============================================================================
-# 7. Example Usage: Benchmark one algorithm on a single function
+# 7. Example Usage: Benchmark all algorithms on all functions and runs
 # ============================================================================
 if __name__ == "__main__":
     # Configuration
@@ -579,58 +579,109 @@ if __name__ == "__main__":
         'LM-CMA-ES': ActiveLM_CMAES,
         'L-SHADE': Improved_L_SHADE,
     }
+
     dim = 10
     max_evals_total = 20000
     num_niches = 3
     exclusion_radius = 0.2
     error_threshold = 1e-8
 
-    # Run each algorithm on a sample function (index 1) and log results
+    # Loop do benchmark
+    n_run = 10
+    base_seed = 42
+    function_indices = [1, 2, 3, 4]
+    function_names = {
+        1: 'Rastrigin-like',
+        2: 'Griewank-like',
+        3: 'Ackley-like',
+        4: 'Sphere-like',
+    }
+
     for algo_name, algo_class in algo_classes.items():
-        print(f"\n=== {algo_name} ===")
-        f, bounds, optimum = get_gnbg_problem(1, dim)
+        print(f"\n{'=' * 72}")
+        print(f"=== Algorithm: {algo_name} ===")
+        print(f"{'=' * 72}")
 
-        # Use lists to allow mutation without nonlocal
-        eval_count = [0]
-        best_err = [np.inf]
-        error_history = []
+        for func_idx in function_indices:
+            func_name = function_names.get(func_idx, f'F{func_idx}')
+            f, bounds, optimum = get_gnbg_problem(func_idx, dim)
 
-        def tracked_func(x):
-            eval_count[0] += 1
-            fval = f(x)
-            if fval < best_err[0]:
-                best_err[0] = fval
-                error_history.append((eval_count[0], fval))
-            return fval
+            print(f"\n--- Function {func_idx} ({func_name}), dim={dim} ---")
 
-        # Run niching optimizer
-        opt = NichingOptimizer(algo_class, tracked_func, dim, bounds,
-                               max_evals_total, num_niches, exclusion_radius,
-                               seed=42)
-        found_optima, logs = opt.run()
+            # Per-function aggregates
+            run_best_errors = []         # error relative to known optimum
+            run_evals_to_threshold = []  # only for successful runs
+            n_successful = 0
 
-        # Find best solution across niches
-        if found_optima:
-            best_x, best_f = min(found_optima, key=lambda t: t[1])
-        else:
-            best_x, best_f = None, np.inf
+            for run_idx in range(n_run):
+                # Reproducible, distinct seed per (function, run).
+                # The internal algorithms derive their own seeds from this one.
+                seed = base_seed + func_idx * 1000 + run_idx
 
-        # Find eval count when threshold reached
-        evals_threshold = None
-        for evals, err in error_history:
-            if err <= error_threshold:
-                evals_threshold = evals
-                break
+                eval_count = [0]
+                best_err = [np.inf]
+                error_history = []
 
-        print(f"Best error: {best_f:.2e}")
-        print(f"Evals to reach {error_threshold}: {evals_threshold if evals_threshold else 'not reached'}")
-        print(f"Total evals used: {eval_count[0]}")
-        print(f"Logs captured for {len(logs)} generations")
+                def tracked_func(x):
+                    eval_count[0] += 1
+                    fval = f(x)
+                    if fval < best_err[0]:
+                        best_err[0] = fval
+                        error_history.append((eval_count[0], fval))
+                    return fval
 
-        # Save logs to CSV (optional)
-        if logs:
-            with open(f"logs_{algo_name}.csv", 'w', newline='') as f_csv:
-                writer = csv.DictWriter(f_csv, fieldnames=logs[0].keys())
-                writer.writeheader()
-                writer.writerows(logs)
-            print(f"Logs saved to logs_{algo_name}.csv")
+                opt = NichingOptimizer(
+                    algo_class, tracked_func, dim, bounds,
+                    max_evals_total, num_niches, exclusion_radius,
+                    seed=seed,
+                )
+                found_optima, logs = opt.run()
+
+                #  Per-run metrics 
+                run_best_error = best_err[0] - optimum
+                run_best_errors.append(run_best_error)
+
+                # First evaluation count at which error <= threshold
+                evals_threshold = None
+                for evals, err in error_history:
+                    if (err - optimum) <= error_threshold:
+                        evals_threshold = evals
+                        break
+
+                is_success = run_best_error <= error_threshold
+                if is_success:
+                    n_successful += 1
+                if evals_threshold is not None:
+                    run_evals_to_threshold.append(evals_threshold)
+
+                print(
+                    f"  Run {run_idx + 1:>2}/{n_run}: "
+                    f"best_err={run_best_error:.2e}, "
+                    f"evals_to_threshold={evals_threshold if evals_threshold is not None else 'N/A'}, "
+                    f"total_evals={eval_count[0]}"
+                )
+
+                #  Save per-run CSV
+                if logs:
+                    fname = f"logs_{algo_name}_{func_name}_run{run_idx + 1}.csv"
+                    with open(fname, 'w', newline='') as f_csv:
+                        writer = csv.DictWriter(f_csv, fieldnames=logs[0].keys())
+                        writer.writeheader()
+                        writer.writerows(logs)
+
+            # Aggregated summary 
+            success_rate = 100.0 * n_successful / n_run if n_run > 0 else 0.0
+            avg_best_error = float(np.mean(run_best_errors)) if run_best_errors else np.inf
+            avg_evals = (
+                float(np.mean(run_evals_to_threshold))
+                if run_evals_to_threshold else None
+            )
+
+            print(f"\n  >>> Summary: {algo_name} / {func_name}")
+            print(f"      Success Rate: {success_rate:.1f}%  "
+                  f"({n_successful}/{n_run})")
+            print(f"      Avg Best Error: {avg_best_error:.3e}")
+            if avg_evals is not None:
+                print(f"      Avg Evals to Threshold (successful runs): {avg_evals:.0f}")
+            else:
+                print(f"      Avg Evals to Threshold (successful runs): N/A")

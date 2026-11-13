@@ -691,8 +691,8 @@ if __name__ == "__main__":
                 if logs:
                     fname = os.path.join(
                         log_dir,
-                        f"logs_{algo_name}_{func_name}_run{run_idx + 1}.csv",
-                    )
+                        f"logs_{algo_name}_{func_name}_run{run_idx + 1}_seed{seed}.csv",
+                        )
                     with open(fname, 'w', newline='') as f_csv:
                         writer = csv.DictWriter(
                             f_csv,

@@ -2,6 +2,7 @@ import numpy as np
 from collections import defaultdict
 import csv
 import os
+import secrets
 
 # ============================================================================
 # 0. Utility: Reflective Bounds
@@ -596,14 +597,29 @@ if __name__ == "__main__":
         2: 'Griewank-like',
         3: 'Ackley-like',
         4: 'Sphere-like',
-        
     }
+    
+    # ----------------------------------------------------------------
+    # Reproducibility
+    #   fixed_base_seed = None  -> generate a fresh random base seed
+    #   fixed_base_seed = <int> -> use that value (reproduces a run)
+    # The chosen base seed is printed so a specific execution can be
+    # replayed later by hard-coding it.
+    # ----------------------------------------------------------------
+    fixed_base_seed = None
+    if fixed_base_seed is None:
+        base_seed = secrets.randbits(31)
+    else:
+        base_seed = fixed_base_seed
+
+    print(f"\nBase seed for this execution: {base_seed}")
+    print("(Set `fixed_base_seed = {0}` in this script to reproduce it.)".format(base_seed))
     
     # Pasta pra exportar os logs
     log_dir = "Logs"
     os.makedirs(log_dir, exist_ok=True)
 
-    for algo_name, algo_class in algo_classes.items():
+    for algo_idx, (algo_name, algo_class) in enumerate(algo_classes.items()):
         print(f"\n{'=' * 72}")
         print(f"=== Algorithm: {algo_name} ===")
         print(f"{'=' * 72}")
@@ -620,9 +636,11 @@ if __name__ == "__main__":
             n_successful = 0
 
             for run_idx in range(n_run):
-                # Reproducible, distinct seed per (function, run).
-                # The internal algorithms derive their own seeds from this one.
-                seed = base_seed + func_idx * 1000 + run_idx
+                # Distinct, reproducible seed per (algorithm, function, run).
+                # algo_idx differentiates the three algorithms,
+                # func_idx differentiates the four functions,
+                # run_idx differentiates repeated runs.
+                seed = base_seed + 100000 * algo_idx + 1000 * func_idx + run_idx
 
                 eval_count = [0]
                 best_err = [np.inf]
@@ -659,13 +677,15 @@ if __name__ == "__main__":
                     n_successful += 1
                 if evals_threshold is not None:
                     run_evals_to_threshold.append(evals_threshold)
+                    
 
                 print(
                     f"  Run {run_idx + 1:>2}/{n_run}: "
+                    f"seed={seed}, "
                     f"best_err={run_best_error:.2e}, "
                     f"evals_to_threshold={evals_threshold if evals_threshold is not None else 'N/A'}, "
                     f"total_evals={eval_count[0]}"
-                )
+                    )
 
                 #  Save per-run CSV
                 if logs:
